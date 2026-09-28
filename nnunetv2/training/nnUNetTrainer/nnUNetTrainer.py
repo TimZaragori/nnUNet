@@ -298,14 +298,11 @@ class nnUNetTrainer(object):
                     self.enable_deep_supervision
                 ).to(self.device)
 
-            self.optimizer, self.lr_scheduler = self.configure_optimizers()
-
             # compile network for free speedup
             if self._do_i_compile():
                 self.print_to_log_file('Using torch.compile...')
                 set_default_inductor_cache_dir()
                 self.network = torch.compile(self.network)
-
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
@@ -321,11 +318,13 @@ class nnUNetTrainer(object):
                     self.network,
                     device_ids=[self.local_rank],
                     output_device=self.local_rank,
-                    find_unused_parameters=not self.enable_deep_supervision)
-
-            self.loss = self._build_loss()
+                    find_unused_parameters=False)
 
             self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
+            
+            self.loss = self._build_loss().to(self.device)
+            # Need to configure optimizer after creating loss to gather parameters defined in loss (used for learned weights)
+            self.optimizer, self.lr_scheduler = self.configure_optimizers()
 
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
@@ -528,9 +527,8 @@ class nnUNetTrainer(object):
                                    dice_class=self.dice_class)
         else:
             loss = self.dc_and_ce_class({'batch_dice': self.configuration_manager.batch_dice,
-                                         'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1,
-                                        weight_dice=1, ignore_label=self.label_manager.ignore_label,
-                                        dice_class=self.dice_class)
+                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weights={'dice':1, 'ce': 1},
+                                   ignore_label=self.label_manager.ignore_label, dice_class=self.dice_class)
 
         if self._do_i_compile():
             # Compile the whole compound loss, not just loss.dc: the dice and the CE start from the same logits, so one
@@ -647,7 +645,7 @@ class nnUNetTrainer(object):
         # the inf check on the GPU instead of making the host wait for it every step. It computes the same update as
         # foreach SGD (nnunetv2/tests/test_training_loop_host_overhead.py)
         fused = self.device.type == 'cuda' and SGD_HAS_FUSED
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr, weight_decay=self.weight_decay,
+        optimizer = torch.optim.SGD(list(self.network.parameters())  + list(self.loss.parameters()), self.initial_lr, weight_decay=self.weight_decay,
                                     momentum=0.99, nesterov=True, **({'fused': True} if fused else {}))
         zero_missing_momentum_buffers(optimizer)
         lr_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs)
@@ -656,6 +654,9 @@ class nnUNetTrainer(object):
     def plot_network_architecture(self):
         if self._do_i_compile():
             self.print_to_log_file("Unable to plot network architecture: nnUNet_compile is enabled!")
+            self.print_to_log_file("\nprinting the network instead:\n")
+            self.print_to_log_file(self.network)
+            self.print_to_log_file("\n")
             return
 
         if self.global_rank == 0:
@@ -685,9 +686,9 @@ class nnUNetTrainer(object):
                 self.print_to_log_file("Unable to plot network architecture:")
                 self.print_to_log_file(e)
 
-                # self.print_to_log_file("\nprinting the network instead:\n")
-                # self.print_to_log_file(self.network)
-                # self.print_to_log_file("\n")
+                self.print_to_log_file("\nprinting the network instead:\n")
+                self.print_to_log_file(self.network)
+                self.print_to_log_file("\n")
             finally:
                 empty_cache(self.device)
         if self.is_ddp:
@@ -1140,6 +1141,12 @@ class nnUNetTrainer(object):
             f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+        if isinstance(self.loss, DeepSupervisionWrapper):
+            if hasattr(self.loss.loss, 'update_weights') and callable(self.loss.loss.update_weights):
+                self.loss.loss.update_weights(n_epoch=self.current_epoch, total_epoch=self.num_epochs)
+        else:
+            if hasattr(self.loss, 'update_weights') and callable(self.loss.update_weights):
+                self.loss.update_weights(n_epoch=self.current_epoch, total_epoch=self.num_epochs)
 
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
@@ -1160,6 +1167,10 @@ class nnUNetTrainer(object):
             output = self.network(data)
             # del data
             l = self.loss(output, target)
+            if hasattr(self.loss, 'compound_loss'):
+                comp_l = self.loss.compound_loss
+            else: 
+                comp_l = {}
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1171,9 +1182,9 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        # The loss stays on the device: reading it here would make the host wait for the GPU in every iteration.
-        # run_training moves all of an epoch's losses at once (outputs_to_host)
-        return {'loss': l.detach()}
+        out = {'loss': l.detach().cpu().numpy()}
+        out.update({'comp_loss_%s' % l_i: comp_l[l_i].detach().cpu().numpy() for l_i in comp_l})
+        return out
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1182,10 +1193,25 @@ class nnUNetTrainer(object):
             losses_tr = [None for _ in range(self.world_size)]
             dist.all_gather_object(losses_tr, outputs['loss'])
             loss_here = np.vstack(losses_tr).mean()
+            comp_loss_here = {}
+            for key in outputs:
+                if 'comp_loss' in key:
+                    comp_loss_tr = [None for _ in range(dist.get_world_size())]
+                    dist.all_gather_object(comp_loss_tr, outputs[key])
+                    comp_loss_here[key] = np.vstack(comp_loss_tr).mean()
         else:
             loss_here = np.mean(outputs['loss'])
+            comp_loss_here = {key.split('comp_loss_')[1]: np.mean(outputs[key]) for key in outputs if 'comp_loss' in key}
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+        self.logger.log('train_compound_losses', comp_loss_here, self.current_epoch)
+
+        if isinstance(self.loss, DeepSupervisionWrapper):
+            if hasattr(self.loss.loss, 'store_losses') and callable(self.loss.loss.store_losses):
+                self.loss.loss.store_losses(average_epoch_total_loss=loss_here, average_epoch_compound_loss=comp_loss_here)
+        else:
+            if hasattr(self.loss, 'store_losses') and callable(self.loss.store_losses):
+                self.loss.store_losses(average_epoch_total_loss=loss_here, average_epoch_compound_loss=comp_loss_here)
 
     def on_validation_epoch_start(self):
         self.network.eval()
@@ -1208,6 +1234,10 @@ class nnUNetTrainer(object):
             output = self.network(data)
             del data
             l = self.loss(output, target)
+            if hasattr(self.loss, 'compound_loss'):
+                comp_l = self.loss.compound_loss
+            else: 
+                comp_l = {}
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1261,8 +1291,9 @@ class nnUNetTrainer(object):
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
-
-        return {'loss': l.detach(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        out = {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+        out.update({'comp_loss_%s' % l_i: comp_l[l_i].detach().cpu().numpy() for l_i in comp_l})
+        return out
 
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
@@ -1286,8 +1317,15 @@ class nnUNetTrainer(object):
             losses_val = [None for _ in range(self.world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
+            comp_loss_here = {}
+            for key in outputs_collated:
+                if 'comp_loss' in key:
+                    comp_loss_val = [None for _ in range(dist.get_world_size())]
+                    dist.all_gather_object(comp_loss_val, outputs_collated[key])
+                    comp_loss_here[key] = np.vstack(comp_loss_val).mean()
         else:
             loss_here = np.mean(outputs_collated['loss'])
+            comp_loss_here = {key.split('comp_loss_')[1]: np.mean(outputs_collated[key]) for key in outputs_collated if 'comp_loss' in key}
 
         # A class absent from BOTH prediction and target gives 0/0 = nan, and the nanmean below drops it -
         # which is what we want: it carries no information about this epoch. On a dataset with many classes
@@ -1300,6 +1338,7 @@ class nnUNetTrainer(object):
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        self.logger.log('val_compound_losses', comp_loss_here, self.current_epoch)
 
     def on_epoch_start(self):
         self._install_exit_signal_handler()
@@ -1308,8 +1347,22 @@ class nnUNetTrainer(object):
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
-        self.print_to_log_file('train_loss', np.round(self.logger.get_value('train_losses', step=-1), decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.get_value('val_losses', step=-1), decimals=4))
+        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
+        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file("compound_train_loss : %s" % ', '.join('%s=%.4f' % (key, value) for key, value in 
+                                                                      self.logger.my_fantastic_logging['train_compound_losses'][-1].items()))
+        if isinstance(self.loss, DeepSupervisionWrapper):
+            if hasattr(self.loss.loss, 'weights'):
+                self.print_to_log_file("compound_loss_weights : %s" % ', '.join('%s=%.4f' % (key, value) for key, value in 
+                                                                            self.loss.loss.weights.items()))
+        else:
+            if hasattr(self.loss, 'weights'):
+                self.print_to_log_file("compound_loss_weights : %s" % ', '.join('%s=%.4f' % (key, value) for key, value in 
+                                                                            self.loss.weights.items()))
+        if list(self.loss.parameters()):
+            self.print_to_log_file("composite loss trained parameters : %s" % {name: param.data for name, param in self.loss.named_parameters()})
+        self.print_to_log_file("compound_val_loss : %s" % ', '.join('%s=%.4f' % (key, value) for key, value in 
+                                                                      self.logger.my_fantastic_logging['val_compound_losses'][-1].items()))
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.get_value('dice_per_class_or_region', step=-1)])
         self.print_to_log_file(
