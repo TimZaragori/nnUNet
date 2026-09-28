@@ -21,7 +21,6 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 # * equal contribution
 ######################################################
 
-
 class AbstractPrimus(nnUNetTrainer_warmup):
     def __init__(
         self,

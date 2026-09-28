@@ -13,6 +13,7 @@ try:
     import wandb
 except ImportError:
     wandb = None
+import numpy as np
 
 
 def get_cluster_job_id():
@@ -150,6 +151,8 @@ class LocalLogger:
             'dice_per_class_or_region': list(),
             'train_losses': list(),
             'val_losses': list(),
+            'train_compound_losses': list(),
+            'val_compound_losses': list(),
             'lrs': list(),
             'epoch_start_timestamps': list(),
             'epoch_end_timestamps': list()
@@ -225,6 +228,22 @@ class LocalLogger:
 
         fig.savefig(join(output_folder, "progress.png"))
         plt.close()
+
+        # Plot progress of compound losses if dict is not empty
+        if self.my_fantastic_logging['train_compound_losses'][-1]:
+            comp_loss_names = self.my_fantastic_logging['train_compound_losses'][-1].keys()
+            fig, ax = plt.subplots(figsize=(30, 24))
+            colors = plt.cm.jet(np.linspace(0, 1, len(comp_loss_names)))
+            for i, l_i in enumerate(comp_loss_names):
+                ax.plot(x_values, [comp_loss_dic[l_i] for comp_loss_dic in self.my_fantastic_logging['train_compound_losses'][:epoch + 1]], 
+                        color=colors[i], ls='-', label="loss_tr_%s" % l_i)
+                ax.plot(x_values, [comp_loss_dic[l_i] for comp_loss_dic in self.my_fantastic_logging['val_compound_losses'][:epoch + 1]], 
+                        color=colors[i], ls='--', label="loss_val_%s" % l_i)
+            ax.set_xlabel("epoch")
+            ax.set_ylabel("compound losses")
+            ax.legend(loc=(0,1))
+            fig.savefig(join(output_folder, "progress_compound_loss.png"))
+            plt.close()
 
     def get_checkpoint(self):
         return self.my_fantastic_logging

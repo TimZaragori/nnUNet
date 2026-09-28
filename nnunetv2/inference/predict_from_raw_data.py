@@ -182,7 +182,7 @@ class nnUNetPredictor(object):
                                        overwrite: bool = True,
                                        part_id: int = 0,
                                        num_parts: int = 1,
-                                       save_probabilities: bool = False):
+                                       save_probabilities: bool = False, save_logits: bool = False):
         if isinstance(list_of_lists_or_source_folder, str):
             list_of_lists_or_source_folder = create_lists_from_splitted_dataset_folder(list_of_lists_or_source_folder,
                                                                                        self.dataset_json['file_ending'])
@@ -208,6 +208,9 @@ class nnUNetPredictor(object):
             if save_probabilities:
                 tmp2 = [isfile(i + '.npz') for i in output_filename_truncated]
                 tmp = [i and j for i, j in zip(tmp, tmp2)]
+            if save_logits:
+                tmp3 = [isfile(i + '_logits.npz') for i in output_filename_truncated]
+                tmp = [i and j for i, j in zip(tmp, tmp3)]
             not_existing_indices = [i for i, j in enumerate(tmp) if not j]
 
             output_filename_truncated = [output_filename_truncated[i] for i in not_existing_indices]
@@ -220,7 +223,7 @@ class nnUNetPredictor(object):
     def predict_from_files(self,
                            list_of_lists_or_source_folder: Union[str, List[List[str]]],
                            output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
-                           save_probabilities: bool = False,
+                           save_probabilities: bool = False, save_logits: bool = False,
                            overwrite: bool = True,
                            num_processes_preprocessing: int = default_num_processes,
                            num_processes_segmentation_export: int = default_num_processes,
@@ -278,7 +281,7 @@ class nnUNetPredictor(object):
                                                                                  output_filename_truncated,
                                                                                  num_processes_preprocessing)
 
-        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+        return self.predict_from_data_iterator(data_iterator, save_probabilities, save_logits, num_processes_segmentation_export)
 
     def _internal_get_data_iterator_from_lists_of_filenames(self,
                                                             input_list_of_lists: List[List[str]],
@@ -362,7 +365,7 @@ class nnUNetPredictor(object):
 
     def predict_from_data_iterator(self,
                                    data_iterator,
-                                   save_probabilities: bool = False,
+                                   save_probabilities: bool = False, save_logits: bool = False,
                                    num_processes_segmentation_export: int = default_num_processes):
         """
         each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
@@ -453,7 +456,7 @@ class nnUNetPredictor(object):
     def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
                                  segmentation_previous_stage: np.ndarray = None,
                                  output_file_truncated: str = None,
-                                 save_or_return_probabilities: bool = False):
+                                 save_or_return_probabilities: bool = False, save_or_return_logits: bool = False):
         """
         WARNING: SLOW. ONLY USE THIS IF YOU CANNOT GIVE NNUNET MULTIPLE IMAGES AT ONCE FOR SOME REASON.
 
@@ -484,18 +487,25 @@ class nnUNetPredictor(object):
         if output_file_truncated is not None:
             export_prediction_from_logits(predicted_logits, dct['data_properties'], self.configuration_manager,
                                           self.plans_manager, self.dataset_json, output_file_truncated,
-                                          save_or_return_probabilities)
+                                          save_or_return_probabilities, save_or_return_logits)
         else:
             ret = convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits, self.plans_manager,
                                                                               self.configuration_manager,
                                                                               self.label_manager,
                                                                               dct['data_properties'],
                                                                               return_probabilities=
-                                                                              save_or_return_probabilities)
+                                                                              save_or_return_probabilities,
+                                                                              return_logits=save_or_return_logits)
             if save_or_return_probabilities:
-                return ret[0], ret[1]
+                if save_or_return_logits:
+                    return ret[0], ret[1], ret[2]
+                else:
+                    return ret[0], ret[1]
             else:
-                return ret
+                if save_or_return_logits:
+                    return ret[0], ret[1]
+                else:
+                    return ret
 
     @torch.inference_mode()
     def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
@@ -838,6 +848,9 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--save_probabilities', action='store_true',
                         help='Set this to export predicted class "probabilities". Required if you want to ensemble '
                              'multiple configurations.')
+    parser.add_argument('--save_logits', action='store_true',
+                        help='Set this to export predicted class "logits". Required if you want to ensemble '
+                             'calibrate the model.')
     parser.add_argument('--continue_prediction', '--c', action='store_true',
                         help='Continue an aborted previous prediction (will not overwrite existing files)')
     parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
@@ -899,6 +912,7 @@ def predict_entry_point_modelfolder():
                                 verbose_preprocessing=args.verbose)
     predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
     predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
+                                 save_logits=args.save_logits,
                                  overwrite=not args.continue_prediction,
                                  num_processes_preprocessing=args.npp,
                                  num_processes_segmentation_export=args.nps,
@@ -942,6 +956,9 @@ def predict_entry_point():
     parser.add_argument('--save_probabilities', action='store_true',
                         help='Set this to export predicted class "probabilities". Required if you want to ensemble '
                              'multiple configurations.')
+    parser.add_argument('--save_logits', action='store_true',
+                        help='Set this to export predicted class "logits". Required if you want to ensemble '
+                             'calibrate the model.')
     parser.add_argument('--continue_prediction', action='store_true',
                         help='Continue an aborted previous prediction (will not overwrite existing files)')
     parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',

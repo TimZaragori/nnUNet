@@ -14,6 +14,7 @@ class DeepSupervisionWrapper(nn.Module):
         assert any([x != 0 for x in weight_factors]), "At least one weight factor should be != 0.0"
         self.weight_factors = tuple(weight_factors)
         self.loss = loss
+        self.compound_loss = {}
 
     def forward(self, *args):
         assert all([isinstance(i, (tuple, list)) for i in args]), \
@@ -26,4 +27,17 @@ class DeepSupervisionWrapper(nn.Module):
         else:
             weights = self.weight_factors
 
-        return sum([weights[i] * self.loss(*inputs) for i, inputs in enumerate(zip(*args)) if weights[i] != 0.0])
+        # TZAR: it shouldn't be much slower than original implementation since it also uses a for loop but we gathered compound losses
+        weighted_loss = 0
+        if hasattr(self.loss, 'compound_loss'):
+            for l_i in self.loss.compound_loss:
+                self.compound_loss[l_i] = 0
+                 
+        for i, inputs in enumerate(zip(*args)):
+            if weights[i] != 0.0:
+                weighted_loss += weights[i] * self.loss(*inputs)
+                if hasattr(self.loss, 'compound_loss'):
+                    for l_i in self.loss.compound_loss:
+                        self.compound_loss[l_i] += weights[i] * self.loss.compound_loss[l_i]
+
+        return weighted_loss

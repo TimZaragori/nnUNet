@@ -17,6 +17,7 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
                                                                 label_manager: LabelManager,
                                                                 properties_dict: dict,
                                                                 return_probabilities: bool = False,
+                                                                return_logits: bool = False,
                                                                 num_threads_torch: int = default_num_processes):
     old_threads = torch.get_num_threads()
     torch.set_num_threads(num_threads_torch)
@@ -65,10 +66,16 @@ def convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits
         predicted_probabilities = predicted_probabilities.transpose([0] + [i + 1 for i in
                                                                            plans_manager.transpose_backward])
         torch.set_num_threads(old_threads)
-        return segmentation_reverted_cropping, predicted_probabilities
+        if return_logits:
+            return segmentation_reverted_cropping, predicted_probabilities, predicted_logits
+        else:
+            return segmentation_reverted_cropping, predicted_probabilities
     else:
         torch.set_num_threads(old_threads)
-        return segmentation_reverted_cropping
+        if return_logits:
+            return segmentation_reverted_cropping, predicted_logits
+        else:
+            return segmentation_reverted_cropping
 
 
 def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, torch.Tensor], properties_dict: dict,
@@ -97,12 +104,22 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
 
     # save
     if save_probabilities:
-        segmentation_final, probabilities_final = ret
+        if save_logits:
+            segmentation_final, probabilities_final, logits_final = ret
+            np.savez_compressed(output_file_truncated + '_logits.npz', logits=logits_final)
+            del logits_final
+        else:
+            segmentation_final, probabilities_final = ret
         np.savez_compressed(output_file_truncated + '.npz', probabilities=probabilities_final)
         save_pickle(properties_dict, output_file_truncated + '.pkl')
         del probabilities_final, ret
     else:
-        segmentation_final = ret
+        if save_logits:
+            segmentation_final, logits_final = ret
+            np.savez_compressed(output_file_truncated + '_logits.npz', logits=logits_final)
+            del logits_final
+        else:
+            segmentation_final = ret
         del ret
 
     rw = plans_manager.image_reader_writer_class()

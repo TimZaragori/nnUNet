@@ -125,6 +125,208 @@ class MemoryEfficientSoftDiceLoss(nn.Module):
 
         dc = dc.mean()
         return -dc
+    
+
+class TverskyLoss(nn.Module):
+    def __init__(self, apply_nonlin: Callable = None, batch_dice: bool = False, do_bg: bool=True, smooth: float = 1., ddp: bool = True,
+                  alpha: float = 0.3, beta: float = 0.7, reduction: str = 'mean'):
+        """
+        paper: https://arxiv.org/pdf/1706.05721.pdf
+        """
+        super(TverskyLoss, self).__init__()
+
+        self.do_bg = do_bg
+        self.batch_dice = batch_dice
+        self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+        self.ddp = ddp
+        self.alpha = alpha
+        self.beta = beta
+        self.reduction = reduction
+
+    def forward(self, x, y, loss_mask=None):
+        shp_x = x.shape
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, len(shp_x)))
+        else:
+            axes = list(range(2, len(shp_x)))
+
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(x, y, axes, loss_mask)
+
+        if self.ddp and self.batch_dice:
+            tp = AllGatherGrad.apply(tp).sum(0)
+            fp = AllGatherGrad.apply(fp).sum(0)
+            fn = AllGatherGrad.apply(fn).sum(0)
+
+        tversky = (tp + self.smooth) / torch.clip(tp + self.alpha*fp + self.beta*fn + self.smooth, 1e-8)
+
+        if not self.do_bg:
+            if self.batch_dice:
+                tversky = tversky[1:]
+            else:
+                tversky = tversky[:, 1:]
+
+        if self.reduction == 'mean':
+            return -tversky.mean()
+        elif self.reduction == 'sum':
+            return -tversky.sum()
+        elif self.reduction == 'none':
+            return -tversky
+        else:
+            raise ValueError(f"Reduction method %s is not supported." % self.reduction)
+    
+
+class DiceWithComplementLoss(nn.Module):
+    def __init__(self, apply_nonlin: Callable = None, batch_dice: bool = False, do_bg: bool = True, smooth: float = 1., ddp: bool = True,
+                 loss_type: int = 1, complement: bool = False, weight: str = None, focal: str = None, gamma: float = 2):
+        """
+        Implement losses as in https://doi.org/10.1016/j.isprsjprs.2020.01.013
+        :param apply_nonlin: function to apply to logits
+        :param batch_dice: compute dice over all voxels in batch or mean of dice in each image of the batch
+        :param loss_type: equation of the loss as in article :
+            1. 2*sum_i(p_i*l_i)/(sum_i(p_i) + sum_i(l_i))
+            2. 2*sum_i(p_i*l_i)/(sum_i(p_i**2 + l_i**2))
+            3. sum_i(p_i*l_i)/(sum_i(p_i**2 + l_i**2) - sum_i(p_i*l_i))
+        :param complement: if True for each class the loss L(p_i, l_i) is equal to 
+        (L(p_i, l_i) + L(1-p_i, 1-l_i))/2
+        :param smooth: ?
+        :param weights: (None or str) weights for each label can be volume or volume_squared
+        :param focal: (None or str) type of focal loss can be hm (homade) 
+        or litterature (Wang et al. Focal Dice Loss and Image Dilation for Brain Tumor Segmentation)
+        :param gamma: gamma > 0 reduces the relative loss for well-classified examples (p>0.5) putting more
+        focus on hard misclassified example
+        """
+        super(DiceWithComplementLoss, self).__init__()
+        self.do_bg = do_bg
+        self.batch_dice = batch_dice
+        self.apply_nonlin = apply_nonlin
+        self.smooth = smooth
+        self.ddp = ddp
+        self.loss_type = loss_type
+        self.complement = complement
+        self.weight = weight
+        self.focal = focal
+        if gamma > 1:
+            self.gamma = 1 / gamma
+        else:
+            self.gamma = gamma
+
+        # Check args
+        if self.loss_type not in [1,2,3]:
+            raise ValueError('loss_type must be in [1,2,3] got %s' % self.loss_type)
+
+        if self.weight not in [None, 'volume', 'volume_square']:
+            raise ValueError('weight must be in [None, volume, volume_square] got %s' % self.weight)
+        
+        if self.focal not in [None, 'hm', 'homemade', 'litterature']:
+            raise ValueError('focal must be in [None, hm, homemade, litterature] got %s' % self.focal)
+        
+    def forward(self, x, y, loss_mask=None):
+        # This forward function is inspired by MemoryEfficientSoftDiceLoss forward function
+        if self.apply_nonlin is not None:
+            x = self.apply_nonlin(x)
+
+        if self.batch_dice:
+            axes = [0] + list(range(2, x.ndim))
+        else:
+            axes = list(range(2, x.ndim))
+
+        with torch.no_grad():
+            if x.ndim != y.ndim:
+                y = y.view((y.shape[0], 1, *y.shape[1:]))
+
+            if x.shape == y.shape:
+                # if this is the case then gt is probably already a one hot encoding
+                y_onehot = y
+            else:
+                y_onehot = torch.zeros(x.shape, device=x.device, dtype=torch.bool)
+                y_onehot.scatter_(1, y.long(), 1)
+        
+        if self.weight is None:
+            weight = torch.ones(x.shape[1], dtype=torch.float, device=x.device)
+        else:
+            sum_gt = y_onehot.sum(axes) if loss_mask is None else (y_onehot * loss_mask).sum(axes)
+            # Weighting as in GDL weight computation, we use 1/V
+            weight = torch.clip(1 / (sum_gt + 1e-6), 1e-6)# add some eps to prevent div by zero
+            if self.weight == 'volume_square':
+                weight = weight ** 2
+
+        # TODO add ddp somewhere when computing loss
+        if self.loss_type == 1:
+            numerator = 2 * x * y_onehot.int()
+            denominator = x + y_onehot.int()
+        elif self.loss_type == 2:
+            numerator = 2 * x * y_onehot.int()
+            denominator = x ** 2 + y_onehot.int() ** 2
+        elif self.loss_type == 3:
+            numerator = x * y_onehot
+            denominator = x ** 2 + y_onehot.int() ** 2 - x * y_onehot.int()
+        else:
+            raise ValueError('loss_type must be in [1,2,3] got %s' % self.loss_type)
+
+        if loss_mask is not None:
+            numerator = numerator * loss_mask
+            denominator = denominator * loss_mask
+
+        numerator = numerator.sum(axes)
+        denominator = denominator.sum(axes)
+
+        if self.ddp and self.batch_dice:
+            numerator = AllGatherGrad.apply(numerator).sum(0)
+            denominator = AllGatherGrad.apply(denominator).sum(0)
+        
+        dc = (weight * (numerator + self.smooth)) / (weight * torch.clip(denominator + self.smooth, 1e-8))
+        
+        if self.complement:
+            if self.loss_type == 1:
+                complement_numerator = 2 * (1-x) * (1-y_onehot.int())
+                complement_denominator = (1-x) + (1-y_onehot.int())
+            elif self.loss_type == 2:
+                complement_numerator = 2 * (1-x) * (1-y_onehot.int())
+                complement_denominator = (1-x) ** 2 + (1-y_onehot.int()) ** 2
+            elif self.loss_type == 3:
+                complement_numerator = (1-x) * (1-y_onehot.int())
+                complement_denominator = (1-x) ** 2 + (1-y_onehot.int()) ** 2 - (1-x) * (1-y_onehot.int())
+            else:
+                raise ValueError('loss_type must be in [1,2,3] got %s' % self.loss_type)
+            
+            if loss_mask is not None:
+                complement_numerator = complement_numerator * loss_mask
+                complement_denominator = complement_denominator * loss_mask
+
+            complement_numerator = complement_numerator.sum(axes)
+            complement_denominator = complement_denominator.sum(axes)
+
+            if self.ddp and self.batch_dice:
+                complement_numerator = AllGatherGrad.apply(complement_numerator).sum(0)
+                complement_denominator = AllGatherGrad.apply(complement_denominator).sum(0)
+            
+            complement_dc = (weight * (complement_numerator + self.smooth)) / (weight * torch.clip(complement_denominator + self.smooth, 1e-8))
+            dc = (dc + complement_dc) / 2
+    
+        if not self.do_bg:
+            if self.batch_dice:
+                dc = dc[1:]
+            else:
+                dc = dc[:, 1:]
+        if self.focal is not None:
+            # TODO : reflexion on effect depending on batch dice etc.
+            # In original article the aim is to counter imbalance between classes and force focus on class harder to predict
+            # This will be the behave here when multiclass + batch_dice because we have one dice per class as presented in article
+            # If no batch dice : when binary problem focus on samples that are hard to predict but in multiclass it is not clear.
+            if self.focal == 'litterature':
+                # add min bound to avoid 0 which will results in nan
+                dc = torch.pow(torch.clip(dc, min=1e-6, max=1), self.gamma)
+            else:
+                focal_weights = torch.pow(1 - dc, self.gamma)
+                # TODO : maybe better way than return here ? Atm, I prefer to be sure that the return as the correct values
+                return ((1 - dc) * focal_weights).mean()
+        dc = dc.mean()
+        return 1 - dc
 
 
 def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
