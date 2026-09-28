@@ -1239,10 +1239,10 @@ class nnUNetTrainer(object):
     def on_epoch_end(self):
         self.logger.log('epoch_end_timestamps', time(), self.current_epoch)
 
-        self.print_to_log_file('train_loss', np.round(self.logger.my_fantastic_logging['train_losses'][-1], decimals=4))
-        self.print_to_log_file('val_loss', np.round(self.logger.my_fantastic_logging['val_losses'][-1], decimals=4))
+        self.print_to_log_file('train_loss', np.round(self.logger.get_value('train_losses', step=-1), decimals=4))
+        self.print_to_log_file('val_loss', np.round(self.logger.get_value('val_losses', step=-1), decimals=4))
         self.print_to_log_file("compound_train_loss : %s" % ', '.join('%s=%.4f' % (key, value) for key, value in 
-                                                                      self.logger.my_fantastic_logging['train_compound_losses'][-1].items()))
+                                                                      self.logger.get_value('train_compound_losses', step=-1).items())) 
         if isinstance(self.loss, DeepSupervisionWrapper):
             if hasattr(self.loss.loss, 'weights'):
                 self.print_to_log_file("compound_loss_weights : %s" % ', '.join('%s=%.4f' % (key, value) for key, value in 
@@ -1254,7 +1254,7 @@ class nnUNetTrainer(object):
         if list(self.loss.parameters()):
             self.print_to_log_file("composite loss trained parameters : %s" % {name: param.data for name, param in self.loss.named_parameters()})
         self.print_to_log_file("compound_val_loss : %s" % ', '.join('%s=%.4f' % (key, value) for key, value in 
-                                                                      self.logger.my_fantastic_logging['val_compound_losses'][-1].items()))
+                                                                      self.logger.get_value('val_compound_losses', step=-1).items())) 
         self.print_to_log_file('Pseudo dice', [np.round(i, decimals=4) for i in
                                                self.logger.get_value('dice_per_class_or_region', step=-1)])
         self.print_to_log_file(

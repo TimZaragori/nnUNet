@@ -207,7 +207,7 @@ class nnUNetDataLoader(DataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
     
     
-class nnUNetDataLoaderAuxiliaryClassifier(nnUNetDataLoaderBase):    
+class nnUNetDataLoaderAuxiliaryClassifier(nnUNetDataLoader):    
     def generate_train_batch(self):
         selected_keys = self.get_indices()
         # preallocate output tensors in final patch size and write transformed samples directly
@@ -271,7 +271,7 @@ class nnUNetDataLoaderAuxiliaryClassifier(nnUNetDataLoaderBase):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'target_aux': aux_label_all}
     
     
-class nnUNetDataLoaderAuxiliaryRegressor(nnUNetDataLoaderBase):
+class nnUNetDataLoaderAuxiliaryRegressor(nnUNetDataLoader):
     def generate_train_batch(self):
         selected_keys = self.get_indices()
         # preallocate output tensors in final patch size and write transformed samples directly
@@ -333,7 +333,7 @@ class nnUNetDataLoaderAuxiliaryRegressor(nnUNetDataLoaderBase):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'target_aux': aux_label_all}
     
 
-class nnUNetDataLoaderSelfSupervision(nnUNetDataLoaderBase):
+class nnUNetDataLoaderSelfSupervision(nnUNetDataLoader):
     def generate_train_batch(self):
         selected_keys = self.get_indices()
         # preallocate output tensors in final patch size and write transformed samples directly
