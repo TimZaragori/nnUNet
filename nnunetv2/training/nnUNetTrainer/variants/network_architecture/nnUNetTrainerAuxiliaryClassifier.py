@@ -9,8 +9,7 @@ from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMu
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
 from batchgenerators.utilities.file_and_folder_operations import join
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
-from nnunetv2.training.dataloading.data_loader_2d import nnUNetDataLoader2DAuxiliaryClassifier
-from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3DAuxiliaryClassifier
+from nnunetv2.training.dataloading.data_loader import nnUNetDataLoaderAuxiliaryClassifier
 from nnunetv2.training.loss.compound_losses import Seg_and_Auxiliary_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
@@ -74,32 +73,18 @@ class nnUNetTrainerAuxiliaryClassifier(nnUNetTrainer):
 
         dataset_tr, dataset_val = self.get_tr_and_val_datasets()
 
-        if dim == 2:
-            dl_tr = nnUNetDataLoader2DAuxiliaryClassifier(dataset_tr, self.batch_size,
-                                                          initial_patch_size,
-                                                          self.configuration_manager.patch_size,
-                                                          self.label_manager,
-                                                          oversample_foreground_percent=self.oversample_foreground_percent,
-                                                          sampling_probabilities=None, pad_sides=None, transforms=tr_transforms)
-            dl_val = nnUNetDataLoader2DAuxiliaryClassifier(dataset_val, self.batch_size,
-                                                           self.configuration_manager.patch_size,
-                                                           self.configuration_manager.patch_size,
-                                                           self.label_manager,
-                                                           oversample_foreground_percent=self.oversample_foreground_percent,
-                                                           sampling_probabilities=None, pad_sides=None, transforms=val_transforms)
-        else:
-            dl_tr = nnUNetDataLoader3DAuxiliaryClassifier(dataset_tr, self.batch_size,
-                                                          initial_patch_size,
-                                                          self.configuration_manager.patch_size,
-                                                          self.label_manager,
-                                                          oversample_foreground_percent=self.oversample_foreground_percent,
-                                                          sampling_probabilities=None, pad_sides=None, transforms=tr_transforms)
-            dl_val = nnUNetDataLoader3DAuxiliaryClassifier(dataset_val, self.batch_size,
-                                                           self.configuration_manager.patch_size,
-                                                           self.configuration_manager.patch_size,
-                                                           self.label_manager,
-                                                           oversample_foreground_percent=self.oversample_foreground_percent,
-                                                           sampling_probabilities=None, pad_sides=None, transforms=val_transforms)
+        dl_tr = nnUNetDataLoaderAuxiliaryClassifier(dataset_tr, self.batch_size,
+                                                        initial_patch_size,
+                                                        self.configuration_manager.patch_size,
+                                                        self.label_manager,
+                                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                                        sampling_probabilities=None, pad_sides=None, transforms=tr_transforms)
+        dl_val = nnUNetDataLoaderAuxiliaryClassifier(dataset_val, self.batch_size,
+                                                        self.configuration_manager.patch_size,
+                                                        self.configuration_manager.patch_size,
+                                                        self.label_manager,
+                                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                                        sampling_probabilities=None, pad_sides=None, transforms=val_transforms)
 
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
