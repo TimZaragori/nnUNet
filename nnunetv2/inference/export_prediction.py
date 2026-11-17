@@ -84,7 +84,8 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
                                   plans_manager: PlansManager,
                                   dataset_json_dict_or_file: Union[dict, str], output_file_truncated: str,
                                   save_probabilities: bool = False,
-                                  num_threads_torch: int = default_num_processes):
+                                  num_threads_torch: int = default_num_processes,
+                                  save_logits: bool = False):
     # if isinstance(predicted_array_or_file, str):
     #     tmp = deepcopy(predicted_array_or_file)
     #     if predicted_array_or_file.endswith('.npy'):
